@@ -1,0 +1,264 @@
+import logging
+import os
+import django
+from datetime import datetime, timedelta
+from django.conf import settings
+from django.utils import timezone
+from asgiref.sync import sync_to_async
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+    CallbackQueryHandler
+)
+token="token"
+
+
+# Настройка логгирования
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Установка Django окружения
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+django.setup()
+
+# Импорт моделей после настройки Django
+from main.models import Schedule, Teacher
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /start. Отправляет приветственное сообщение и показывает клавиатуру."""
+    keyboard = [[KeyboardButton("Показать мой Telegram ID"), KeyboardButton("Показать расписание")]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    await update.message.reply_text(
+        "Привет! Используйте кнопки ниже для получения информации.",
+        reply_markup=reply_markup,
+    )
+
+async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправляет пользователю его Telegram ID."""
+    user_id = update.effective_user.id
+    
+    await update.message.reply_text(
+        f"Ваш Telegram ID: `{user_id}`\n\n"
+        "Скопируйте ID и вставьте его в поле 'Telegram ID' в вашем профиле на сайте БМЭ.",
+        parse_mode="Markdown"
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправляет сообщение с помощью по использованию бота."""
+    await update.message.reply_text(
+        "Доступные команды:\n"
+        "• Показать мой Telegram ID - получить ваш ID для привязки к профилю\n"
+        "• Показать расписание - посмотреть расписание на выбранную дату"
+    )
+
+@sync_to_async
+def get_available_schedule_dates():
+    """Получает даты с опубликованными расписаниями для вчера, сегодня и завтра."""
+    today = timezone.now().date()
+    yesterday = today - timedelta(days=1)
+    tomorrow = today + timedelta(days=1)
+    
+    dates_to_check = [yesterday, today, tomorrow]
+    available_dates = []
+    
+    for date in dates_to_check:
+        if Schedule.objects.filter(date=date, is_public=True).exists():
+            available_dates.append(date)
+    
+    return available_dates
+
+def format_date_display(date):
+    """Форматирует дату для отображения пользователю."""
+    today = timezone.now().date()
+    
+    if date == today:
+        return f"Сегодня ({date.strftime('%d.%m.%Y')})"
+    elif date == today - timedelta(days=1):
+        return f"Вчера ({date.strftime('%d.%m.%Y')})"
+    elif date == today + timedelta(days=1):
+        return f"Завтра ({date.strftime('%d.%m.%Y')})"
+    else:
+        return date.strftime('%d.%m.%Y')
+
+async def show_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает даты с доступными расписаниями."""
+    available_dates = await get_available_schedule_dates()
+    
+    if not available_dates:
+        await update.message.reply_text(
+            "На данный момент нет опубликованных расписаний на вчера, сегодня и завтра."
+        )
+        return
+    
+    # Создаем inline клавиатуру с датами
+    keyboard = []
+    for date in available_dates:
+        date_text = format_date_display(date)
+        callback_data = f"schedule_{date.strftime('%Y-%m-%d')}"
+        keyboard.append([InlineKeyboardButton(date_text, callback_data=callback_data)])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "Выберите дату для просмотра расписания:",
+        reply_markup=reply_markup
+    )
+
+@sync_to_async
+def get_teacher_by_telegram_id(telegram_id):
+    """Получает преподавателя по Telegram ID."""
+    try:
+        teacher = Teacher.objects.get(user__telegram_id=str(telegram_id), is_working=True)
+        return teacher
+    except Teacher.DoesNotExist:
+        return None
+
+@sync_to_async
+def format_schedule_for_teacher(schedules, teacher):
+    """Форматирует расписание для конкретного преподавателя."""
+    teacher_lessons = []
+    
+    for schedule in schedules:
+        for lesson in schedule.lessons.filter(teacher=teacher):
+            teacher_lessons.append((schedule, lesson))
+    
+    if not teacher_lessons:
+        return None
+    
+    # Сортируем по времени пары
+    teacher_lessons.sort(key=lambda x: x[0].lesson_time)
+    
+    message = f"📅 <b>Ваше расписание на {teacher_lessons[0][0].date.strftime('%d.%m.%Y')}:</b>\n\n"
+    
+    for schedule, lesson in teacher_lessons:
+        classroom = lesson.classroom or "Не указана"
+        groups = ", ".join([str(group) for group in schedule.group.all()])
+        students_count = lesson.students.count()
+        
+        message += f"📚 <b>Пара {schedule.lesson_time}:</b>\n"
+        message += f"⏰ {schedule.get_lesson_time_display()}\n"
+        message += f"🏢 Здание: {schedule.location}\n"
+        message += f"🏫 Аудитория: {classroom}\n"
+        message += f"🎓 Уровень: {lesson.grade}\n"
+        message += f"👥 Группы: {groups}\n"
+        message += f"👨‍🎓 Студенты: {students_count}\n"
+        
+        if lesson.is_extra:
+            message += f"📝 Дополнительное занятие\n"
+        if lesson.is_quiz:
+            message += f"📊 Контрольный срез\n"
+        
+        message += "\n"
+    
+    return message
+
+@sync_to_async
+def get_schedules_by_date(selected_date):
+    """Получает расписания на выбранную дату."""
+    return list(Schedule.objects.filter(date=selected_date, is_public=True).prefetch_related(
+        'group', 'lessons__teacher', 'lessons__grade', 'lessons__students', 'location'
+    ))
+
+async def handle_schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает callback с выбором даты расписания."""
+    query = update.callback_query
+    await query.answer()
+    
+    # Извлекаем дату из callback_data
+    callback_data = query.data
+    if not callback_data.startswith("schedule_"):
+        await query.edit_message_text("Ошибка: неверные данные.")
+        return
+    
+    date_str = callback_data.replace("schedule_", "")
+    try:
+        selected_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+    except ValueError:
+        await query.edit_message_text("Ошибка: неверный формат даты.")
+        return
+    
+    # Получаем расписания на выбранную дату
+    schedules = await get_schedules_by_date(selected_date)
+    
+    if not schedules:
+        await query.edit_message_text(
+            f"На {selected_date.strftime('%d.%m.%Y')} нет опубликованного расписания."
+        )
+        return
+    
+    # Проверяем, является ли пользователь преподавателем
+    user_telegram_id = update.effective_user.id
+    teacher = await get_teacher_by_telegram_id(user_telegram_id)
+    
+    if teacher:
+        # Показываем персональное расписание преподавателя
+        teacher_schedule = await format_schedule_for_teacher(schedules, teacher)
+        if teacher_schedule:
+            message = teacher_schedule
+        else:
+            message = f"У вас нет занятий на {selected_date.strftime('%d.%m.%Y')}."
+    else:
+        # Показываем полное расписание
+        message = f'внесите ваш Telegram ID в профиль на сайте БМЭ\n\n'
+        message += f"Ваш Telegram ID: <code>{user_telegram_id}</code>\n"
+    
+    # Telegram имеет ограничение на длину сообщения (4096 символов)
+    if len(message) > 4000:
+        # Разбиваем сообщение на части
+        parts = []
+        current_part = ""
+        
+        for line in message.split('\n'):
+            if len(current_part + line + '\n') > 4000:
+                parts.append(current_part)
+                current_part = line + '\n'
+            else:
+                current_part += line + '\n'
+        
+        if current_part:
+            parts.append(current_part)
+        
+        # Отправляем первую часть как редактирование исходного сообщения
+        await query.edit_message_text(parts[0], parse_mode="HTML")
+        
+        # Отправляем остальные части как новые сообщения
+        for part in parts[1:]:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=part,
+                parse_mode="HTML"
+            )
+    else:
+        await query.edit_message_text(message, parse_mode="HTML")
+
+def main() -> None:
+    """Запускает бота."""
+    # Получаем токен из настроек Django
+    #token = settings.TELEGRAM_BOT_TOKEN
+    if not token:
+        logger.error("Токен Telegram бота не найден в настройках!")
+        return
+    
+    # Создаем приложение
+    application = Application.builder().token(token).build()
+    
+    # Добавляем обработчики
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(MessageHandler(filters.Regex("^Показать мой Telegram ID$"), get_id))
+    application.add_handler(MessageHandler(filters.Regex("^Показать расписание$"), show_schedule))
+    application.add_handler(CallbackQueryHandler(handle_schedule_callback, pattern="^schedule_"))
+    
+    # Запускаем бота
+    logger.info("Бот запущен!")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main() 
