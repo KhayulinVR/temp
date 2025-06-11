@@ -100,7 +100,7 @@ def take_data_from_db_csv_with_tab_to_str(name_db, num_column, num_line):
 
 # ===========================
 # бот
-bot = telebot.TeleBot("8114478648:AAHLNpB2YgwiLAfDkImQGCLxtu4_Vq42a4A")
+bot = telebot.TeleBot(token_token)
 
 def add_quotes(temp_str):
     return '```'+temp_str+'```'
